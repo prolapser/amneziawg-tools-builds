@@ -1,0 +1,338 @@
+name: Check and Build amneziawg-tools
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: 'принудительно собрать конкретный тег (например v1.0.20260223)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  check-new-tag:
+    name: Check for new upstream tag
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag:      ${{ steps.compare.outputs.new_tag }}
+      should_build: ${{ steps.compare.outputs.should_build }}
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v6
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          fetch-depth: 0
+
+      - name: Get latest upstream tag
+        id: upstream
+        run: |
+          LATEST=$(curl -sf \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/amnezia-vpn/amneziawg-tools/tags?per_page=1" \
+            | jq -r '.[0].name')
+
+          if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+            echo "::error::Не удалось получить теги upstream-репозитория"
+            exit 1
+          fi
+
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Последний upstream-тег: $LATEST"
+
+      - name: Get last built tag from this repo
+        id: local
+        run: |
+          LAST_BUILT=$(git tag --list 'built/*' \
+            | sed 's|built/||' \
+            | sort -V \
+            | tail -1)
+
+          echo "tag=${LAST_BUILT:-none}" >> "$GITHUB_OUTPUT"
+          echo "Последний собранный тег: ${LAST_BUILT:-none}"
+
+      - name: Compare tags
+        id: compare
+        run: |
+          UPSTREAM="${{ steps.upstream.outputs.tag }}"
+          LOCAL="${{ steps.local.outputs.tag }}"
+          FORCE="${{ github.event.inputs.force_tag }}"
+
+          if [ -n "$FORCE" ]; then
+            echo "Принудительная сборка тега: $FORCE"
+            echo "new_tag=$FORCE"     >> "$GITHUB_OUTPUT"
+            echo "should_build=true"  >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$UPSTREAM" != "$LOCAL" ]; then
+            echo "Обнаружен новый тег: $UPSTREAM (предыдущий: $LOCAL)"
+            echo "new_tag=$UPSTREAM"  >> "$GITHUB_OUTPUT"
+            echo "should_build=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "Новых тегов нет. Сборка не требуется."
+            echo "new_tag=$UPSTREAM"  >> "$GITHUB_OUTPUT"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-linux-x64:
+    name: Build ${{ matrix.artifact_name }}
+    needs: check-new-tag
+    if: needs.check-new-tag.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: linux-ubuntu-x64
+            container: ubuntu:22.04
+            install_cmd: apt-get update -q && apt-get install -y build-essential git
+
+          - artifact_name: linux-alpine-x64
+            container: alpine:3.19
+            install_cmd: apk add --no-cache linux-headers build-base git
+
+    env:
+      TAG: ${{ needs.check-new-tag.outputs.new_tag }}
+
+    container:
+      image: ${{ matrix.container }}
+
+    steps:
+      - name: Install dependencies
+        run: ${{ matrix.install_cmd }}
+
+      - name: Clone upstream source at tag ${{ env.TAG }}
+        run: |
+          git clone --depth 1 --branch "$TAG" \
+            https://github.com/amnezia-vpn/amneziawg-tools.git src
+
+      - name: Build
+        working-directory: src/src
+        run: |
+          make -j"$(nproc)" \
+            WITH_BASHCOMPLETION=no \
+            WITH_WGQUICK=no \
+            WITH_SYSTEMDUNITS=no
+
+          echo "--- собранные файлы ---"
+          ls -lh
+
+      - name: Package
+        working-directory: src/src
+        run: |
+          mkdir staging
+          cp wg staging/awg
+          cp wg-quick/linux.bash staging/awg-quick
+
+          ARCHIVE="${{ matrix.artifact_name }}.tar.gz"
+          tar -czf "$ARCHIVE" -C staging .
+          ls -lh "$ARCHIVE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: src/src/${{ matrix.artifact_name }}.tar.gz
+          retention-days: 1
+
+  build-linux-arm64:
+    name: Build linux-ubuntu-arm64
+    needs: check-new-tag
+    if: needs.check-new-tag.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm
+
+    env:
+      TAG: ${{ needs.check-new-tag.outputs.new_tag }}
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y build-essential git
+
+      - name: Clone upstream source at tag ${{ env.TAG }}
+        run: |
+          git clone --depth 1 --branch "$TAG" \
+            https://github.com/amnezia-vpn/amneziawg-tools.git src
+
+      - name: Build
+        working-directory: src/src
+        run: |
+          make -j"$(nproc)" \
+            WITH_BASHCOMPLETION=no \
+            WITH_WGQUICK=no \
+            WITH_SYSTEMDUNITS=no
+
+          echo "--- собранные файлы ---"
+          ls -lh
+
+      - name: Package
+        working-directory: src/src
+        run: |
+          mkdir staging
+          cp wg staging/awg
+          cp wg-quick/linux.bash staging/awg-quick
+
+          tar -czf linux-ubuntu-arm64.tar.gz -C staging .
+          ls -lh linux-ubuntu-arm64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          name: linux-ubuntu-arm64
+          path: src/src/linux-ubuntu-arm64.tar.gz
+          retention-days: 1
+
+  build-windows:
+    name: Build windows
+    needs: check-new-tag
+    if: needs.check-new-tag.outputs.should_build == 'true'
+    runs-on: windows-latest
+
+    env:
+      TAG: ${{ needs.check-new-tag.outputs.new_tag }}
+
+    steps:
+      - name: Clone upstream source at tag ${{ env.TAG }}
+        run: |
+          git clone --depth 1 --branch "$env:TAG" `
+            https://github.com/amnezia-vpn/amneziawg-tools.git src
+
+      - name: Build via build.cmd
+        working-directory: src
+        run: cmd /c build.cmd
+
+      - name: Show build results
+        working-directory: src
+        shell: pwsh
+        run: |
+          foreach ($arch in @("x64", "x86", "arm64")) {
+            if (Test-Path $arch) {
+              Write-Host "--- $arch ---"
+              Get-ChildItem $arch | Format-Table Name, Length
+            } else {
+              Write-Warning "Директория $arch не найдена"
+            }
+          }
+
+      - name: Package with PowerShell
+        working-directory: src
+        shell: pwsh
+        run: |
+          foreach ($arch in @("x64", "x86", "arm64")) {
+            if (Test-Path $arch) {
+              $archive = "windows-${arch}.zip"
+              Compress-Archive -Path "$arch\*" -DestinationPath $archive -Force
+              $size = (Get-Item $archive).Length / 1KB
+              Write-Host "Создан $archive ($([math]::Round($size, 1)) KB)"
+            }
+          }
+
+      - name: Upload windows-x64
+        uses: actions/upload-artifact@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          name: windows-x64
+          path: src/windows-x64.zip
+          retention-days: 1
+
+      - name: Upload windows-x86
+        uses: actions/upload-artifact@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          name: windows-x86
+          path: src/windows-x86.zip
+          retention-days: 1
+
+      - name: Upload windows-arm64
+        uses: actions/upload-artifact@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          name: windows-arm64
+          path: src/windows-arm64.zip
+          retention-days: 1
+  
+  release:
+    name: Create GitHub Release
+    needs: [check-new-tag, build-linux-x64, build-linux-arm64, build-windows]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check-new-tag.outputs.new_tag }}
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v6
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Show collected artifacts
+        run: ls -lhR dist/
+
+      - name: Generate checksums (SHA256)
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$TAG" \
+            --title "amneziawg-tools $TAG" \
+            --notes "## amneziawg-tools $TAG
+
+          Автоматическая сборка из upstream-тега [$TAG](https://github.com/amnezia-vpn/amneziawg-tools/releases/tag/$TAG).
+
+          ### Linux
+          | Libc  | Архитектура | Файл |
+          |-------|-------------|------|
+          | glibc | x64         | \`linux-ubuntu-x64.tar.gz\` |
+          | glibc | arm64       | \`linux-ubuntu-arm64.tar.gz\` |
+          | musl  | x64         | \`linux-alpine-x64.tar.gz\` |
+
+          ### Windows
+          | Архитектура | Файл |
+          |-------------|------|
+          | x64         | \`windows-x64.zip\` |
+          | x86         | \`windows-x86.zip\` |
+          | arm64       | \`windows-arm64.zip\` |
+
+          ### Содержимое Linux-архивов
+          - \`awg\` — основной инструмент управления AmneziaWG
+          - \`awg-quick\` — скрипт быстрой настройки интерфейса
+
+          > SHA256-суммы всех файлов — в \`SHA256SUMS.txt\`" \
+            dist/*
+
+      - name: Mark tag as built
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "built/$TAG" || true
+          git push origin "built/$TAG" || true
